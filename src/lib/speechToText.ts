@@ -1,60 +1,68 @@
 import fs from "fs";
 import path from "path";
 
+/**
+ * Convert WhatsApp voice/audio → text using OpenAI Whisper (REST)
+ * SDK-free, Vercel-safe
+ */
 export async function speechToText(
     audioUrl: string
 ): Promise<{ text: string; language: string } | null> {
     try {
-        const res = await fetch(audioUrl);
-        if (!res.ok) {
+        console.log("⬇️ Downloading audio:", audioUrl);
+
+        const audioRes = await fetch(audioUrl);
+        if (!audioRes.ok) {
             throw new Error("Failed to download audio file");
         }
 
-        const arrayBuffer = await res.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
+        const buffer = Buffer.from(await audioRes.arrayBuffer());
+        const filePath = path.join("/tmp", `voice-${Date.now()}.ogg`);
+        fs.writeFileSync(filePath, buffer);
 
-        const audioPath = path.join("/tmp", `voice-${Date.now()}.ogg`);
-        fs.writeFileSync(audioPath, buffer);
-
-        const fileBuffer = fs.readFileSync(audioPath);
+        console.log("🎧 Audio saved:", filePath);
 
         const formData = new FormData();
-        const blob = new Blob([fileBuffer], { type: "audio/ogg" });
-        formData.append("file", blob, "voice.ogg");
+        formData.append(
+            "file",
+            new Blob([fs.readFileSync(filePath)]),
+            "voice.ogg"
+        );
         formData.append("model", "whisper-1");
         formData.append("response_format", "verbose_json");
 
-        const apiKey = process.env.OPENAI_API_KEY;
-        if (!apiKey) {
-            fs.unlinkSync(audioPath);
-            return null;
-        }
-
-        const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
             method: "POST",
             headers: {
-                Authorization: `Bearer ${apiKey}`,
+                Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
             },
-            
             body: formData as any,
         });
 
-        fs.unlinkSync(audioPath);
+        fs.unlinkSync(filePath);
 
-        if (!resp.ok) {
+        if (!res.ok) {
+            const errText = await res.text();
+            console.error("❌ Whisper API error:", errText);
             return null;
         }
 
-        const json = await resp.json();
+        const json = await res.json();
 
-        const text = (json?.text as string) || null;
-        const language = (json?.language as string) || (json?.detected_language as string) || "english";
+        const text = json.text?.trim();
+        const language = json.language || "english";
 
-        if (!text) return null;
+        if (!text) {
+            console.error("❌ Empty transcription result");
+            return null;
+        }
 
-        return { text: text.trim(), language };
+        console.log("📝 Transcription success:", text);
+
+        return { text, language };
+
     } catch (err) {
-        console.error("Speech-to-text error:", err);
+        console.error("❌ Speech-to-text error:", err);
         return null;
     }
 }
