@@ -3,7 +3,7 @@ import { embedText } from "./embeddings";
 import { retrieveRelevantChunksFromFiles } from "./retrieval";
 import { getFilesForPhoneNumber } from "./phoneMapping";
 import { sendWhatsAppMessage } from "./whatsappSender";
-import { transcribeAudioFromUrl } from "./speechToText";
+import { speechToText } from "./speechToText";
 import Groq from "groq-sdk";
 
 const groq = new Groq({
@@ -95,14 +95,14 @@ export async function generateAutoResponse(
 
         // 🎤 Voice message
         if (!finalUserText && mediaUrl) {
-            const transcript = await transcribeAudioFromUrl(mediaUrl);
+            const transcriptObj = await speechToText(mediaUrl);
 
-            if (!transcript) {
+            if (!transcriptObj) {
                 return { success: false, error: "Failed to transcribe voice message" };
             }
 
-            finalUserText = transcript;
-            detectedLanguage = await detectLanguage(finalUserText);
+            finalUserText = transcriptObj.text;
+            detectedLanguage = transcriptObj.language || (await detectLanguage(finalUserText));
         }
 
         // 📝 Text message
