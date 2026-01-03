@@ -1,45 +1,47 @@
-import Groq from "groq-sdk";
+import OpenAI from "openai";
 import fs from "fs";
 import path from "path";
-import os from "os";
 
-/**
- * Groq client
- */
-const groq = new Groq({
-    apiKey: process.env.GROQ_API_KEY!,
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY!,
 });
 
 /**
- * Download audio from WhatsApp media URL and transcribe it
+ * Converts WhatsApp audio (URL) → text using Whisper
+ * Supports multi-language input automatically
  */
-export async function transcribeAudioFromUrl(mediaUrl: string): Promise<string | null> {
+export async function speechToText(
+    audioUrl: string
+): Promise<{ text: string; language: string } | null> {
     try {
-        // 1️⃣ Download audio
-        const response = await fetch(mediaUrl);
-        if (!response.ok) {
-            console.error("Failed to download audio");
+        const res = await fetch(audioUrl);
+        if (!res.ok) {
+            throw new Error("Failed to download audio file");
+        }
+
+        const buffer = Buffer.from(await res.arrayBuffer());
+
+        const audioPath = path.join("/tmp", `voice-${Date.now()}.ogg`);
+        fs.writeFileSync(audioPath, buffer);
+
+        const transcription = await openai.audio.transcriptions.create({
+            file: fs.createReadStream(audioPath),
+            model: "whisper-1",
+            response_format: "verbose_json",
+        });
+
+        fs.unlinkSync(audioPath);
+
+        const text = transcription.text?.trim();
+
+        if (!text) {
             return null;
         }
 
-        const buffer = Buffer.from(await response.arrayBuffer());
-
-        // 2️⃣ Save temp audio file
-        const tempDir = os.tmpdir();
-        const audioPath = path.join(tempDir, `whatsapp-audio-${Date.now()}.ogg`);
-        fs.writeFileSync(audioPath, buffer);
-
-        // 3️⃣ Transcribe using Groq Whisper
-        const transcription = await groq.audio.transcriptions.create({
-            file: fs.createReadStream(audioPath),
-            model: "whisper-large-v3",
-            response_format: "text",
-        });
-
-        // 4️⃣ Cleanup
-        fs.unlinkSync(audioPath);
-
-        return transcription?.trim() || null;
+        return {
+            text,
+            language: transcription.language || "english",
+        };
     } catch (err) {
         console.error("Speech-to-text error:", err);
         return null;

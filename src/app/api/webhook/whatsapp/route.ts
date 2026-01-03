@@ -1,11 +1,8 @@
 import { NextResponse } from "next/server";
 import { supabase } from "@/lib/supabaseClient";
 import { generateAutoResponse } from "@/lib/autoResponder";
-import { transcribeAudioFromUrl } from "@/lib/speechToText";
+import { speechToText } from "@/lib/speechToText";
 
-/**
- * WhatsApp Webhook Payload (extended for voice)
- */
 type WhatsAppWebhookPayload = {
     messageId: string;
     channel: string;
@@ -13,18 +10,20 @@ type WhatsAppWebhookPayload = {
     to: string;
     receivedAt: string;
     content: {
-        contentType: "text" | "audio";
+        contentType: "text" | "media";
         text?: string;
-        mediaUrl?: string; // 👈 for voice messages
+        media?: {
+            type: string;
+            url: string;
+        };
     };
     whatsapp?: {
         senderName?: string;
     };
     timestamp: string;
-    event: "MoMessage" | "MtMessage";
+    event: string;
     isin24window?: boolean;
     isResponded?: boolean;
-    UserResponse?: string;
 };
 
 export async function POST(req: Request) {
@@ -33,141 +32,91 @@ export async function POST(req: Request) {
 
         console.log("📩 Received WhatsApp webhook:", payload);
 
-        // Basic validation
         if (!payload.messageId || !payload.from || !payload.to) {
             return NextResponse.json(
-                { error: "Missing required fields: messageId, from, or to" },
+                { error: "Missing required fields" },
                 { status: 400 }
             );
         }
 
-        let finalUserText: string | null = null;
-        let transcription: string | null = null;
+        // 1️⃣ Store incoming message (text OR voice)
+        const { error } = await supabase.from("whatsapp_messages").insert([
+            {
+                message_id: payload.messageId,
+                channel: payload.channel,
+                from_number: payload.from,
+                to_number: payload.to,
+                received_at: payload.receivedAt,
+                content_type: payload.content?.contentType,
+                content_text: payload.content?.text || null,
+                sender_name: payload.whatsapp?.senderName,
+                event_type: payload.event,
+                is_in_24_window: payload.isin24window || false,
+                is_responded: payload.isResponded || false,
+                raw_payload: payload,
+            },
+        ]);
 
-        /* --------------------------------------------------
-           📝 TEXT MESSAGE
-        -------------------------------------------------- */
-        if (payload.content?.contentType === "text") {
-            finalUserText =
-                payload.content.text ||
-                payload.UserResponse ||
-                null;
+        if (error) {
+            if (error.code === "23505") {
+                return NextResponse.json({ success: true, duplicate: true });
+            }
+            throw error;
         }
 
-        /* --------------------------------------------------
-           🎤 VOICE MESSAGE
-        -------------------------------------------------- */
-        if (payload.content?.contentType === "audio") {
-            const mediaUrl = payload.content.mediaUrl;
-
-            if (!mediaUrl) {
-                console.error("❌ Audio message without mediaUrl");
-                return NextResponse.json({ success: true });
-            }
-
-            console.log("🎧 Voice message detected, transcribing...");
-
-            transcription = await transcribeAudioFromUrl(mediaUrl);
-
-            if (!transcription) {
-                console.error("❌ Voice transcription failed");
-                return NextResponse.json({ success: true });
-            }
-
-            finalUserText = transcription;
-            console.log("📝 Transcription:", transcription);
+        // Only respond to user messages
+        if (payload.event !== "MoMessage") {
+            return NextResponse.json({ success: true });
         }
 
-        /* --------------------------------------------------
-           🗄️ STORE MESSAGE IN DATABASE
-        -------------------------------------------------- */
-        const { error: insertError } = await supabase
-            .from("whatsapp_messages")
-            .insert([
-                {
-                    message_id: payload.messageId,
-                    channel: payload.channel,
-                    from_number: payload.from,
-                    to_number: payload.to,
-                    received_at: payload.receivedAt,
-                    content_type: payload.content?.contentType,
-                    content_text: finalUserText,
-                    sender_name: payload.whatsapp?.senderName,
-                    event_type: payload.event,
-                    is_in_24_window: payload.isin24window || false,
-                    is_responded: payload.isResponded || false,
-                    raw_payload: {
-                        ...payload,
-                        transcription,
-                    },
-                },
-            ]);
+        let finalText: string | null = null;
+        let mediaUrl: string | undefined;
 
-        if (insertError) {
-            // Duplicate message safeguard
-            if (insertError.code === "23505") {
-                return NextResponse.json({
-                    success: true,
-                    duplicate: true,
-                    message: "Message already processed",
-                });
-            }
-            throw insertError;
+        // 2️⃣ TEXT MESSAGE
+        if (payload.content.contentType === "text") {
+            finalText = payload.content.text || null;
         }
 
-        /* --------------------------------------------------
-           🤖 AUTO RESPONSE (ONLY USER → BUSINESS)
-        -------------------------------------------------- */
-        if (finalUserText && payload.event === "MoMessage") {
-            console.log("🤖 Generating auto response...");
+        // 3️⃣ VOICE MESSAGE
+        if (
+            payload.content.contentType === "media" &&
+            payload.content.media?.type === "audio"
+        ) {
+            mediaUrl = payload.content.media.url;
+            console.log("🎙 Voice message detected:", mediaUrl);
 
-            const result = await generateAutoResponse(
-                payload.from, // customer
-                payload.to,   // business number
-                finalUserText,
-                payload.messageId
-            );
+            const stt = await speechToText(mediaUrl);
 
-            if (result.success) {
-                console.log("✅ Auto-response sent successfully");
-            } else {
-                console.error("❌ Auto-response failed:", result.error);
+            if (!stt || !stt.text) {
+                console.error("❌ Speech-to-text failed");
+                return NextResponse.json({ success: false });
             }
+
+            finalText = stt.text;
+            console.log("📝 Transcribed text:", finalText);
         }
 
-        return NextResponse.json({
-            success: true,
-            message: "WhatsApp webhook processed successfully",
-        });
+        if (!finalText) {
+            console.warn("⚠️ No usable message content");
+            return NextResponse.json({ success: true });
+        }
 
-    } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : "Unknown error";
-        console.error("🔥 WEBHOOK_ERROR:", message, err);
+        // 4️⃣ Generate AI response
+        await generateAutoResponse(
+            payload.from,
+            payload.to,
+            finalText,
+            payload.messageId,
+            mediaUrl
+        );
+
+        return NextResponse.json({ success: true });
+
+    } catch (err) {
+        console.error("WEBHOOK_ERROR:", err);
         return NextResponse.json(
-            { error: message },
+            { error: "Webhook processing failed" },
             { status: 500 }
         );
     }
-}
-
-/* --------------------------------------------------
-   🔐 WEBHOOK VERIFICATION (UNCHANGED)
--------------------------------------------------- */
-export async function GET(req: Request) {
-    const { searchParams } = new URL(req.url);
-    const mode = searchParams.get("hub.mode");
-    const token = searchParams.get("hub.verify_token");
-    const challenge = searchParams.get("hub.challenge");
-
-    const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN!;
-
-    if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        console.log("✅ Webhook verified");
-        return new Response(challenge, { status: 200 });
-    }
-
-    return NextResponse.json(
-        { error: "Verification failed" },
-        { status: 403 }
-    );
 }
