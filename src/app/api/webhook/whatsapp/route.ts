@@ -13,7 +13,7 @@ type WhatsAppWebhookPayload = {
         contentType: "text" | "media";
         text?: string;
         media?: {
-            type: string;
+            type: "audio" | "voice" | string;
             url: string;
         };
     };
@@ -57,14 +57,16 @@ export async function POST(req: Request) {
             },
         ]);
 
+        // Duplicate message → ignore safely
         if (error) {
-            if (error.code === "23505") {
+            if ((error as any).code === "23505") {
+                console.log("ℹ️ Duplicate message ignored");
                 return NextResponse.json({ success: true, duplicate: true });
             }
             throw error;
         }
 
-        // Only respond to user messages
+        // Only respond to incoming user messages
         if (payload.event !== "MoMessage") {
             return NextResponse.json({ success: true });
         }
@@ -74,13 +76,16 @@ export async function POST(req: Request) {
 
         // 2️⃣ TEXT MESSAGE
         if (payload.content.contentType === "text") {
-            finalText = payload.content.text || null;
+            finalText = payload.content.text?.trim() || null;
+            console.log("💬 Text message:", finalText);
         }
 
-        // 3️⃣ VOICE MESSAGE
+        // 3️⃣ VOICE MESSAGE (IMPORTANT FIX HERE)
         if (
             payload.content.contentType === "media" &&
-            payload.content.media?.type === "audio"
+            payload.content.media?.url &&
+            (payload.content.media.type === "voice" ||
+                payload.content.media.type === "audio")
         ) {
             mediaUrl = payload.content.media.url;
             console.log("🎙 Voice message detected:", mediaUrl);
@@ -92,7 +97,7 @@ export async function POST(req: Request) {
                 return NextResponse.json({ success: false });
             }
 
-            finalText = stt.text;
+            finalText = stt.text.trim();
             console.log("📝 Transcribed text:", finalText);
         }
 
@@ -101,7 +106,7 @@ export async function POST(req: Request) {
             return NextResponse.json({ success: true });
         }
 
-        // 4️⃣ Generate AI response
+        // 4️⃣ Generate AI response (RAG + language aware)
         await generateAutoResponse(
             payload.from,
             payload.to,
