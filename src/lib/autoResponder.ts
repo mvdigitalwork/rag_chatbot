@@ -3,17 +3,11 @@ import { embedText } from "./embeddings";
 import { retrieveRelevantChunksFromFiles } from "./retrieval";
 import { getFilesForPhoneNumber } from "./phoneMapping";
 import { sendWhatsAppMessage } from "./whatsappSender";
+import { transcribeAudioFromUrl } from "./speechToText";
 import Groq from "groq-sdk";
-import OpenAI from "openai";
-import fs from "fs";
-import path from "path";
 
 const groq = new Groq({
     apiKey: process.env.GROQ_API_KEY!,
-});
-
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY!,
 });
 
 export type AutoResponseResult = {
@@ -25,49 +19,27 @@ export type AutoResponseResult = {
 };
 
 /**
- * Convert WhatsApp audio → text using Whisper
- */
-async function speechToText(audioUrl: string): Promise<{ text: string; language: string }> {
-    const audioRes = await fetch(audioUrl);
-    if (!audioRes.ok) {
-        throw new Error("Failed to download WhatsApp audio");
-    }
-
-    const buffer = Buffer.from(await audioRes.arrayBuffer());
-    const tmpPath = path.join("/tmp", `audio-${Date.now()}.ogg`);
-    fs.writeFileSync(tmpPath, buffer);
-
-    const transcription = await openai.audio.transcriptions.create({
-        file: fs.createReadStream(tmpPath),
-        model: "whisper-1",
-        response_format: "verbose_json",
-    });
-
-    fs.unlinkSync(tmpPath);
-
-    return {
-        text: transcription.text || "",
-        language: transcription.language || "english",
-    };
-}
-
-/**
- * Detect language for text messages
+ * Detect language of text (Hindi / English / Gujarati / etc.)
  */
 async function detectLanguage(text: string): Promise<string> {
-    const completion = await groq.chat.completions.create({
-        model: "llama-3.3-70b-versatile",
-        temperature: 0,
-        messages: [
-            {
-                role: "system",
-                content: "Detect the language of the given text. Reply with ONLY the language name."
-            },
-            { role: "user", content: text }
-        ]
-    });
+    try {
+        const completion = await groq.chat.completions.create({
+            model: "llama-3.3-70b-versatile",
+            temperature: 0,
+            messages: [
+                {
+                    role: "system",
+                    content:
+                        "Detect the language of the given text. Reply with ONLY the language name (e.g. English, Hindi, Gujarati).",
+                },
+                { role: "user", content: text },
+            ],
+        });
 
-    return completion.choices[0].message.content?.toLowerCase() || "english";
+        return completion.choices[0].message.content?.toLowerCase() || "english";
+    } catch {
+        return "english";
+    }
 }
 
 /**
@@ -81,7 +53,9 @@ export async function generateAutoResponse(
     mediaUrl?: string
 ): Promise<AutoResponseResult> {
     try {
-        // 1️⃣ Get documents mapped to business number
+        /**
+         * 1️⃣ Fetch documents mapped to this business number
+         */
         const fileIds = await getFilesForPhoneNumber(toNumber);
 
         if (fileIds.length === 0) {
@@ -92,14 +66,16 @@ export async function generateAutoResponse(
             };
         }
 
-        // 2️⃣ Fetch phone config
-        const { data: phoneMappings } = await supabase
+        /**
+         * 2️⃣ Fetch phone configuration
+         */
+        const { data: phoneMappings, error: mappingError } = await supabase
             .from("phone_document_mapping")
             .select("system_prompt, intent, auth_token, origin")
             .eq("phone_number", toNumber);
 
-        if (!phoneMappings || phoneMappings.length === 0) {
-            return { success: false, error: "Phone mapping not found" };
+        if (mappingError || !phoneMappings || phoneMappings.length === 0) {
+            return { success: false, error: "Phone configuration not found" };
         }
 
         const { system_prompt, auth_token, origin } = phoneMappings[0];
@@ -111,15 +87,26 @@ export async function generateAutoResponse(
             };
         }
 
-        // 3️⃣ Normalize user input (TEXT or VOICE)
-        let finalUserText = messageText || "";
+        /**
+         * 3️⃣ Normalize user input (TEXT or VOICE)
+         */
+        let finalUserText = messageText?.trim() || "";
         let detectedLanguage = "english";
 
+        // 🎤 Voice message
         if (!finalUserText && mediaUrl) {
-            const stt = await speechToText(mediaUrl);
-            finalUserText = stt.text;
-            detectedLanguage = stt.language;
-        } else {
+            const transcript = await transcribeAudioFromUrl(mediaUrl);
+
+            if (!transcript) {
+                return { success: false, error: "Failed to transcribe voice message" };
+            }
+
+            finalUserText = transcript;
+            detectedLanguage = await detectLanguage(finalUserText);
+        }
+
+        // 📝 Text message
+        if (finalUserText) {
             detectedLanguage = await detectLanguage(finalUserText);
         }
 
@@ -127,12 +114,26 @@ export async function generateAutoResponse(
             return { success: false, error: "Empty user message" };
         }
 
-        // 4️⃣ RAG
+        /**
+         * 4️⃣ RAG Retrieval
+         */
         const queryEmbedding = await embedText(finalUserText);
-        const matches = await retrieveRelevantChunksFromFiles(queryEmbedding, fileIds, 5);
-        const contextText = matches.map(m => m.chunk).join("\n\n");
 
-        // 5️⃣ Conversation history
+        if (!queryEmbedding) {
+            return { success: false, error: "Failed to embed query" };
+        }
+
+        const matches = await retrieveRelevantChunksFromFiles(
+            queryEmbedding,
+            fileIds,
+            5
+        );
+
+        const contextText = matches.map((m) => m.chunk).join("\n\n");
+
+        /**
+         * 5️⃣ Conversation history (last 20)
+         */
         const { data: historyRows } = await supabase
             .from("whatsapp_messages")
             .select("content_text, event_type")
@@ -141,20 +142,22 @@ export async function generateAutoResponse(
             .limit(20);
 
         const history = (historyRows || [])
-            .filter(m => m.content_text)
-            .map(m => ({
+            .filter((m) => m.content_text)
+            .map((m) => ({
                 role: m.event_type === "MoMessage" ? "user" as const : "assistant" as const,
-                content: m.content_text
+                content: m.content_text,
             }));
 
-        // 6️⃣ System Prompt
+        /**
+         * 6️⃣ System Prompt
+         */
         const rules = `
 You MUST answer strictly from the provided CONTEXT.
 If the answer is not present, say:
 "I don't have that information in the document."
 
 Reply in ${detectedLanguage}.
-Keep it short, friendly and WhatsApp-ready.
+Keep replies short, friendly and WhatsApp-ready.
 `;
 
         const systemPrompt = `
@@ -166,7 +169,9 @@ CONTEXT:
 ${contextText || "No relevant context found."}
 `;
 
-        // 7️⃣ LLM Call
+        /**
+         * 7️⃣ LLM Generation
+         */
         const completion = await groq.chat.completions.create({
             model: "llama-3.3-70b-versatile",
             temperature: 0.2,
@@ -174,8 +179,8 @@ ${contextText || "No relevant context found."}
             messages: [
                 { role: "system", content: systemPrompt },
                 ...history.slice(-10),
-                { role: "user", content: finalUserText }
-            ]
+                { role: "user", content: finalUserText },
+            ],
         });
 
         const response = completion.choices[0].message.content;
@@ -184,8 +189,15 @@ ${contextText || "No relevant context found."}
             return { success: false, error: "LLM returned empty response" };
         }
 
-        // 8️⃣ Send WhatsApp reply
-        const sendResult = await sendWhatsAppMessage(fromNumber, response, auth_token, origin);
+        /**
+         * 8️⃣ Send WhatsApp reply
+         */
+        const sendResult = await sendWhatsAppMessage(
+            fromNumber,
+            response,
+            auth_token,
+            origin
+        );
 
         if (!sendResult.success) {
             return {
@@ -196,7 +208,9 @@ ${contextText || "No relevant context found."}
             };
         }
 
-        // 9️⃣ Save AI message
+        /**
+         * 9️⃣ Save AI response
+         */
         await supabase.from("whatsapp_messages").insert([
             {
                 message_id: `auto_${messageId}_${Date.now()}`,
@@ -209,11 +223,13 @@ ${contextText || "No relevant context found."}
                 sender_name: "AI Assistant",
                 event_type: "MtMessage",
                 is_in_24_window: true,
-                raw_payload: { isAutoResponse: true }
-            }
+                raw_payload: { isAutoResponse: true },
+            },
         ]);
 
-        // 10️⃣ Mark responded
+        /**
+         * 🔟 Mark original message responded
+         */
         await supabase
             .from("whatsapp_messages")
             .update({
@@ -227,7 +243,6 @@ ${contextText || "No relevant context found."}
             response,
             sent: true,
         };
-
     } catch (error) {
         console.error("Auto-response error:", error);
         return {
