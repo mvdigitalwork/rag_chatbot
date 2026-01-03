@@ -8,6 +8,7 @@ const groq = new Groq({
 
 /**
  * FREE Voice → Text using Groq Whisper
+ * NOTE: Groq Whisper does NOT return language field
  */
 export async function speechToText(
     audioUrl: string
@@ -27,7 +28,6 @@ export async function speechToText(
         const transcription = await groq.audio.transcriptions.create({
             file: fs.createReadStream(audioPath),
             model: "whisper-large-v3",
-            response_format: "verbose_json",
         });
 
         fs.unlinkSync(audioPath);
@@ -37,7 +37,7 @@ export async function speechToText(
 
         return {
             text,
-            language: transcription.language || "unknown",
+            language: "unknown", // ✅ FIX: Groq does not provide language
         };
 
     } catch (err) {
