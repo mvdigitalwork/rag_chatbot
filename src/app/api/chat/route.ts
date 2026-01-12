@@ -20,22 +20,20 @@ export async function POST(req: Request) {
             );
         }
 
-        // 1. Embed the user query
+        // 1️⃣ Embed user query
         const queryEmbedding = await embedText(message);
-
         if (!queryEmbedding) {
             return NextResponse.json(
-                { error: "Failed to generate embedding" },
+                { error: "Embedding failed" },
                 { status: 500 }
             );
         }
 
-        // 2. Retrieve relevant chunks
+        // 2️⃣ Retrieve relevant chunks
         const matches = await retrieveRelevantChunks(queryEmbedding, file_id, 5);
+        const contextText = matches.map(m => m.chunk).join("\n\n");
 
-        const contextText = matches.map((m) => m.chunk).join("\n\n");
-
-        // 3. Load conversation history
+        // 3️⃣ Load chat history
         const { data: historyRows } = await supabase
             .from("messages")
             .select("role, content")
@@ -47,61 +45,89 @@ export async function POST(req: Request) {
             content: m.content
         }));
 
-        // 4. Inject RAG context into Groq LLM
+        // 4️⃣ SYSTEM PROMPT (CRITICAL FIX)
+        const systemPrompt = `
+You are a WhatsApp conversational assistant.
+
+STRICT BEHAVIOR RULES:
+
+1. Language Mirroring (Mandatory)
+- Reply in the SAME language and style as the user.
+- Hindi → Hindi
+- English → English
+- Hinglish → Hinglish
+- Broken / casual → reply naturally the same way
+- Do NOT mention language detection.
+
+2. Knowledge Boundary
+- Answer ONLY using the information provided below.
+- If the answer is not clearly available:
+  - Politely say the information is not available right now.
+  - Do NOT guess or assume.
+  - Do NOT explain why.
+
+3. Forbidden Words
+- NEVER use words like:
+  "document", "documents", "dataset", "knowledge base", "data source", "training data"
+
+4. Human Tone
+- Professional but friendly
+- WhatsApp-style short replies
+- Light emojis allowed 😊
+- Never robotic
+
+Fallback examples:
+- Hinglish: "Is topic pe abhi exact info available nahi hai 😊 Aap kuch aur pooch sakte ho."
+- Hindi: "Is vishay par abhi jaankari uplabdh nahi hai 😊"
+- English: "I don’t have the right information on this yet 😊"
+
+INFORMATION:
+${contextText || "No relevant information available."}
+        `.trim();
+
         const messages = [
-            {
-                role: "system",
-                content:
-                    `You are a helpful document assistant. Your ONLY job is to answer questions based strictly on the provided document context.\n\n` +
-                    `STRICT RULES:\n` +
-                    `- ONLY answer questions using information from the CONTEXT below\n` +
-                    `- If the answer is not in the CONTEXT, say "I don't have that information in the document"\n` +
-                    `- NEVER use your general knowledge or make assumptions beyond the document\n` +
-                    `- NEVER offer to do tasks you cannot do (generate QR codes, create files, etc.)\n` +
-                    `- If asked about yourself or your technology, say "I can only answer questions about the document"\n` +
-                    `- Be concise, friendly, and use natural language\n` +
-                    `- Format responses with paragraphs and bullet points when appropriate\n\n` +
-                    `CONTEXT:\n${contextText}`
-            },
+            { role: "system", content: systemPrompt },
             ...history,
             { role: "user", content: message }
         ];
 
-        // 5. Call Groq with streaming
+        // 5️⃣ Stream response from Groq
         const completion = await groq.chat.completions.create({
             model: "llama-3.3-70b-versatile",
             messages,
-            temperature: 0.2,
-            stream: true
+            temperature: 0.3,
+            stream: true,
         });
 
-        // Create a streaming response
         const encoder = new TextEncoder();
         const stream = new ReadableStream({
             async start(controller) {
                 try {
                     for await (const chunk of completion) {
-                        const content = chunk.choices[0]?.delta?.content || "";
+                        const content = chunk.choices[0]?.delta?.content;
                         if (content) {
                             controller.enqueue(encoder.encode(content));
                         }
                     }
                     controller.close();
-                } catch (error) {
-                    controller.error(error);
+                } catch (err) {
+                    controller.error(err);
                 }
             }
         });
 
         return new Response(stream, {
             headers: {
-                'Content-Type': 'text/plain; charset=utf-8',
-                'Transfer-Encoding': 'chunked'
-            }
+                "Content-Type": "text/plain; charset=utf-8",
+                "Transfer-Encoding": "chunked",
+            },
         });
-    } catch (err: unknown) {
+
+    } catch (err) {
         console.error("CHAT_ERROR:", err);
-        const message = err instanceof Error ? err.message : "Unknown error";
-        return NextResponse.json({ error: message }, { status: 500 });
+        return NextResponse.json(
+            { error: "Chat processing failed" },
+            { status: 500 }
+        );
     }
 }
