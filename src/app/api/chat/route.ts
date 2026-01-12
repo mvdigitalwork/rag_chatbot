@@ -20,7 +20,7 @@ export async function POST(req: Request) {
       );
     }
 
-    /* 1️⃣ Embed user message */
+    /* 1️⃣ Embed user query */
     const queryEmbedding = await embedText(message);
     if (!queryEmbedding) {
       return NextResponse.json(
@@ -29,12 +29,12 @@ export async function POST(req: Request) {
       );
     }
 
-    /* 2️⃣ Retrieve relevant chunks */
+    /* 2️⃣ Retrieve chunks */
     const matches = await retrieveRelevantChunks(queryEmbedding, file_id, 5);
     const hasContext = matches.length > 0;
     const contextText = matches.map(m => m.chunk).join("\n\n");
 
-    /* 3️⃣ Load conversation history */
+    /* 3️⃣ Load chat history */
     const { data: historyRows } = await supabase
       .from("messages")
       .select("role, content")
@@ -46,48 +46,67 @@ export async function POST(req: Request) {
       content: m.content,
     }));
 
-    /* 4️⃣ SYSTEM PROMPT (STRICT + FIXED) */
-    const systemPrompt = hasContext
-      ? `
+    /* 4️⃣ STRICT SYSTEM PROMPT */
+    const systemPrompt = `
 You are a WhatsApp conversational assistant.
 
-MANDATORY RULES:
-- Reply in the SAME language & style as the user (Hindi / Hinglish / English / mixed).
-- Be natural, professional, friendly.
-- WhatsApp-style short replies.
-- Light emojis allowed 😊 (do not overuse).
+========================
+LANGUAGE RULES (STRICT)
+========================
+You are ALLOWED to reply ONLY in:
+- Hinglish (default)
+- English
+- Hindi (देवनागरी)
+- Gujarati (ગુજરાતી)
 
-KNOWLEDGE RULES:
-- Answer ONLY using the information below.
-- Do NOT guess.
-- Do NOT add extra knowledge.
-- Do NOT explain limitations.
+Rules:
+- Clear English → English reply
+- Hindi script → Hindi reply
+- Gujarati script → Gujarati reply
+- Mixed / Roman Hindi / broken → Hinglish reply
+- NEVER reply in any other language
+- NEVER mention language detection
+
+========================
+BEHAVIOR
+========================
+- Professional but friendly
+- Natural, human tone
+- Short WhatsApp-style replies
+- Light emojis allowed 😊 (no overuse)
+- Never robotic or scripted
+
+========================
+KNOWLEDGE RULES
+========================
+- Answer ONLY using the INFORMATION section
+- NEVER guess or assume
+- NEVER add external knowledge
+- NEVER explain limitations
 
 FORBIDDEN WORDS:
-- document, dataset, knowledge base, data source, training data
+document, documents, dataset, knowledge base, training data, source
 
-INFORMATION:
-${contextText}
-      `.trim()
-      : `
-You are a WhatsApp conversational assistant.
+========================
+FALLBACK RULE
+========================
+If INFORMATION is empty or answer is not found:
+- Clearly say information is not available right now
+- Be polite & helpful
+- Do NOT explain why
+- Do NOT mention data or documents
 
-STRICT RULE:
-- NO relevant information is available for this question.
+Fallback examples:
+Hinglish: "Is topic pe abhi exact info available nahi hai 😊 Aap kuch aur pooch sakte ho."
+Hindi: "Is vishay par abhi jaankari uplabdh nahi hai 😊"
+English: "I don’t have the right information on this yet 😊"
+Gujarati: "આ વિષય પર હાલમાં ચોક્કસ માહિતી ઉપલબ્ધ નથી 😊"
 
-BEHAVIOR:
-- Reply in SAME language & style as the user.
-- Be polite, friendly, human.
-- Light emojis allowed 😊.
-- Clearly say information is not available.
-- Do NOT guess.
-- Do NOT explain why.
-
-Fallback examples (use same language as user):
-- Hinglish: "Is topic pe abhi exact info available nahi hai 😊 Aap kuch aur pooch sakte ho."
-- Hindi: "Is vishay par abhi jaankari uplabdh nahi hai 😊"
-- English: "I don’t have the right information on this yet 😊"
-      `.trim();
+========================
+INFORMATION
+========================
+${hasContext ? contextText : "NO_INFORMATION_AVAILABLE"}
+`.trim();
 
     const messages = [
       { role: "system", content: systemPrompt },
@@ -95,11 +114,11 @@ Fallback examples (use same language as user):
       { role: "user", content: message },
     ];
 
-    /* 5️⃣ Stream response from Groq */
+    /* 5️⃣ Stream response */
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       messages,
-      temperature: 0.3,
+      temperature: 0.2,
       stream: true,
     });
 
@@ -109,9 +128,7 @@ Fallback examples (use same language as user):
         try {
           for await (const chunk of completion) {
             const content = chunk.choices[0]?.delta?.content;
-            if (content) {
-              controller.enqueue(encoder.encode(content));
-            }
+            if (content) controller.enqueue(encoder.encode(content));
           }
           controller.close();
         } catch (err) {
