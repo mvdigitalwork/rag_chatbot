@@ -3,7 +3,7 @@ import Groq from "groq-sdk";
 import { supabase } from "@/lib/supabaseClient";
 
 const groq = new Groq({
-    apiKey: process.env.GROQ_API_KEY,
+    apiKey: process.env.GROQ_API_KEY!,
 });
 
 export async function POST(req: NextRequest) {
@@ -22,65 +22,73 @@ export async function POST(req: NextRequest) {
 
         const completion = await groq.chat.completions.create({
             model: "llama-3.3-70b-versatile",
-            temperature: 0.6,
-            max_tokens: 500,
+            temperature: 0.5,
+            max_tokens: 450,
             messages: [
                 {
                     role: "system",
                     content: `
-You are an expert Conversational AI Architect.
+You are a senior Conversational AI Architect.
 
 Your task is to generate a SYSTEM PROMPT for a WhatsApp chatbot.
 
-STRICT RULES (NON-NEGOTIABLE):
+STRICT & NON-NEGOTIABLE RULES:
 
-1. Language & Style Mirroring
-- The chatbot MUST reply in the SAME language, script, and tone used by the user.
-- If the user writes in Hinglish → reply in Hinglish.
-- If the user writes in Hindi → reply in Hindi.
-- If the user writes in English → reply in English.
-- If the user mixes languages or writes broken sentences → reply naturally in the same style.
-- NEVER mention language detection or switching.
+1️⃣ Supported Languages ONLY
+The chatbot is allowed to reply ONLY in these 4 languages:
+- Hinglish (default)
+- English
+- Hindi (देवनागरी)
+- Gujarati (ગુજરાતી)
 
-2. Human-like Behavior
-- Replies must feel natural, warm, and human.
-- Professional but friendly tone.
-- Light emojis allowed (😊 👍 😅), never overuse.
-- WhatsApp-style short, clear messages.
-- NEVER sound robotic, scripted, or automated.
+Language Selection Rules:
+- Clear English → English reply
+- Hindi script → Hindi reply
+- Gujarati script → Gujarati reply
+- Mixed, Roman Hindi, broken, casual → Hinglish reply
+- NEVER reply in any other language
+- NEVER mention language detection
 
-3. Knowledge Usage
-- The chatbot should answer strictly based on its available knowledge base.
-- NEVER mention words like "document", "dataset", "source", "training data", or "knowledge base".
+2️⃣ Human-like WhatsApp Tone
+- Professional but friendly
+- Natural, human replies
+- Short WhatsApp-style messages
+- Light emojis allowed 😊👍 (no overuse)
+- NEVER robotic or scripted
 
-4. Fallback Rule (VERY IMPORTANT)
-- If an exact answer is NOT available:
-  - Politely say that the information is not available right now.
-  - Offer help in another way.
-  - Do NOT say why the data is missing.
-  - Do NOT mention documents or internal data.
+3️⃣ Knowledge Usage Rules
+- Answer strictly from available information only
+- NEVER guess or hallucinate
+- NEVER mention internal sources
 
-Example fallback styles:
-- Hinglish: "Is topic pe abhi exact info available nahi hai 😊 Aap kuch aur poochna chahen to bataiye."
-- Hindi: "Is vishay par abhi jaankari uplabdh nahi hai 😊 Aap koi aur sawaal pooch sakte hain."
-- English: "I don’t have the right information on this yet 😊 Feel free to ask something else."
+Forbidden words:
+"document", "documents", "dataset", "knowledge base", "training data", "source"
 
-5. Personalization
-- If the user's name is known, use it naturally in replies.
+4️⃣ Fallback Rule (CRITICAL)
+If exact information is NOT available:
+- Politely say information is not available right now
+- Offer help with something else
+- Do NOT explain why
+- Do NOT mention documents or data
+
+Fallback examples:
+- Hinglish: "Is topic pe abhi exact info available nahi hai 😊 Aap kuch aur pooch sakte ho."
+- Hindi: "Is vishay par abhi jaankari uplabdh nahi hai 😊"
+- English: "I don’t have the right information on this yet 😊"
+- Gujarati: "આ વિષય પર હાલમાં ચોક્કસ માહિતી ઉપલબ્ધ નથી 😊"
+
+5️⃣ Personalization
+- If user's name is known, use it naturally
 - Example: "Hi Rahul 😊", "Thanks for reaching out, Ayesha!"
 
 Generate ONLY the system prompt text.
-Do NOT add explanations or formatting.
+No explanations.
 Keep it under 250 words.
                     `.trim(),
                 },
                 {
                     role: "user",
-                    content: `
-Create a system prompt for a WhatsApp chatbot with the following intent:
-
-"${intent}"
-                    `.trim(),
+                    content: `Create a system prompt for a WhatsApp chatbot with this intent:\n"${intent}"`,
                 },
             ],
         });
@@ -91,26 +99,19 @@ Create a system prompt for a WhatsApp chatbot with the following intent:
             throw new Error("Failed to generate system prompt");
         }
 
-        console.log("Generated system prompt:", systemPrompt);
-
-        // Check existing mappings
+        // Save / Update in DB
         const { data: existingMappings } = await supabase
             .from("phone_document_mapping")
-            .select("*")
+            .select("id")
             .eq("phone_number", phone_number);
 
         if (existingMappings && existingMappings.length > 0) {
-            const { error } = await supabase
+            await supabase
                 .from("phone_document_mapping")
-                .update({
-                    intent,
-                    system_prompt: systemPrompt,
-                })
+                .update({ intent, system_prompt: systemPrompt })
                 .eq("phone_number", phone_number);
-
-            if (error) throw error;
         } else {
-            const { error } = await supabase
+            await supabase
                 .from("phone_document_mapping")
                 .insert({
                     phone_number,
@@ -118,8 +119,6 @@ Create a system prompt for a WhatsApp chatbot with the following intent:
                     system_prompt: systemPrompt,
                     file_id: null,
                 });
-
-            if (error) throw error;
         }
 
         return NextResponse.json({
@@ -130,14 +129,8 @@ Create a system prompt for a WhatsApp chatbot with the following intent:
 
     } catch (error) {
         console.error("System prompt generation error:", error);
-
         return NextResponse.json(
-            {
-                error:
-                    error instanceof Error
-                        ? error.message
-                        : "Failed to generate system prompt",
-            },
+            { error: "Failed to generate system prompt" },
             { status: 500 }
         );
     }
