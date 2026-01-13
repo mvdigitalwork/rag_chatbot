@@ -10,35 +10,46 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY!,
 });
 
-/* ❌ STOP WORDS */
-const NEGATIVE_KEYWORDS = [
-  "no", "nahi", "nahin",
-  "ok", "okay",
-  "thanks", "thank you",
-  "not interested", "later"
-];
+/* 🔒 FIXED RETURN TYPE */
+export type AutoResponseResult = {
+  success: boolean;
+  response: string | null;
+  error: string | null;
+  noDocuments: boolean;
+  sent: boolean;
+};
 
-/* 🧠 Language detection (ONLY 4) */
-function detectLanguage(text: string): "hinglish" | "hindi" | "english" | "gujarati" {
-  if (/[\u0A80-\u0AFF]/.test(text)) return "gujarati";
-  if (/[\u0900-\u097F]/.test(text)) return "hindi";
-  if (/(hai|nahi|kya|ka|ki|ho)/i.test(text)) return "hinglish";
-  return "english";
+/* 🔤 Limited Language Detection */
+function normalizeLanguage(lang: string) {
+  const l = lang.toLowerCase();
+  if (l.includes("gujarati")) return "Gujarati";
+  if (l.includes("hindi")) return "Hindi";
+  if (l.includes("hinglish")) return "Hinglish";
+  return "English";
 }
 
-/* 🔁 Fallback replies */
-function fallback(lang: string) {
-  switch (lang) {
-    case "hinglish":
-      return "Is topic pe abhi exact info available nahi hai 😊";
-    case "hindi":
-      return "Is vishay par abhi jaankari uplabdh nahi hai 😊";
-    case "gujarati":
-      return "આ વિષય પર હાલમાં માહિતી ઉપલબ્ધ નથી 😊";
-    default:
-      return "I don’t have the right information on this yet 😊";
+async function detectLanguage(text: string): Promise<string> {
+  try {
+    const res = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Detect the language. Reply ONLY with: Hindi, Hinglish, English, Gujarati.",
+        },
+        { role: "user", content: text },
+      ],
+    });
+
+    return normalizeLanguage(res.choices[0].message.content || "English");
+  } catch {
+    return "English";
   }
 }
+
+/* ================= MAIN ================= */
 
 export async function generateAutoResponse(
   fromNumber: string,
@@ -46,122 +57,176 @@ export async function generateAutoResponse(
   messageText: string | null,
   messageId: string,
   mediaUrl?: string
-) {
+): Promise<AutoResponseResult> {
   try {
-    /* 1️⃣ Session check */
-    const { data: session } = await supabase
-      .from("whatsapp_sessions")
-      .select("*")
-      .eq("from_number", fromNumber)
-      .eq("to_number", toNumber)
+    /* 🚫 STOP if already responded */
+    const { data: existing } = await supabase
+      .from("whatsapp_messages")
+      .select("auto_respond_sent")
+      .eq("message_id", messageId)
       .single();
 
-    if (session?.conversation_state === "STOPPED") {
-      return { success: true };
+    if (existing?.auto_respond_sent) {
+      return {
+        success: true,
+        response: null,
+        error: null,
+        noDocuments: false,
+        sent: false,
+      };
     }
 
-    /* 2️⃣ Normalize input */
-    let finalText = messageText?.trim() || "";
-
-    if (!finalText && mediaUrl) {
-      const stt = await speechToText(mediaUrl);
-      if (!stt?.text) return { success: false };
-      finalText = stt.text.trim();
-    }
-
-    if (!finalText) return { success: false };
-
-    const lower = finalText.toLowerCase();
-
-    /* 🛑 NEGATIVE INTENT */
-    if (NEGATIVE_KEYWORDS.some(k => lower === k || lower.includes(k))) {
-      await supabase.from("whatsapp_sessions").upsert({
-        from_number: fromNumber,
-        to_number: toNumber,
-        conversation_state: "STOPPED",
-        last_user_message: finalText,
-      });
-
-      await sendWhatsAppMessage(
-        fromNumber,
-        "Theek hai 😊",
-        process.env.WHATSAPP_11ZA_AUTH_TOKEN!,
-        process.env.WHATSAPP_11ZA_ORIGIN!
-      );
-
-      return { success: true };
-    }
-
-    /* 3️⃣ Language */
-    const language = detectLanguage(finalText);
-
-    /* 4️⃣ Files */
+    /* 1️⃣ Files */
     const fileIds = await getFilesForPhoneNumber(toNumber);
     if (fileIds.length === 0) {
-      const reply = fallback(language);
-      await sendWhatsAppMessage(fromNumber, reply,
-        process.env.WHATSAPP_11ZA_AUTH_TOKEN!,
-        process.env.WHATSAPP_11ZA_ORIGIN!
-      );
-      return { success: true };
+      return {
+        success: false,
+        response: null,
+        error: "No information available",
+        noDocuments: true,
+        sent: false,
+      };
     }
 
-    /* 5️⃣ RAG */
-    const embedding = await embedText(finalText);
-    const matches = await retrieveRelevantChunksFromFiles(embedding, fileIds, 5);
+    /* 2️⃣ Phone config */
+    const { data: mapping } = await supabase
+      .from("phone_document_mapping")
+      .select("system_prompt, auth_token, origin")
+      .eq("phone_number", toNumber)
+      .limit(1)
+      .single();
+
+    if (!mapping?.auth_token || !mapping?.origin) {
+      return {
+        success: false,
+        response: null,
+        error: "WhatsApp credentials missing",
+        noDocuments: false,
+        sent: false,
+      };
+    }
+
+    /* 3️⃣ User text */
+    let userText = messageText?.trim() || "";
+    let language = "English";
+
+    if (!userText && mediaUrl) {
+      const stt = await speechToText(mediaUrl);
+      if (!stt?.text) {
+        return {
+          success: false,
+          response: null,
+          error: "Voice transcription failed",
+          noDocuments: false,
+          sent: false,
+        };
+      }
+      userText = stt.text;
+    }
+
+    language = await detectLanguage(userText);
+
+    /* 4️⃣ RAG */
+    const embedding = await embedText(userText);
+    if (!embedding) {
+      return {
+        success: false,
+        response: null,
+        error: "Embedding failed",
+        noDocuments: false,
+        sent: false,
+      };
+    }
+
+    const matches = await retrieveRelevantChunksFromFiles(
+      embedding,
+      fileIds,
+      5
+    );
+
     const contextText = matches.map(m => m.chunk).join("\n\n");
 
-    /* 6️⃣ SYSTEM PROMPT */
+    /* 5️⃣ Prompt */
     const systemPrompt = `
 You are a WhatsApp assistant.
 
 RULES:
-- Reply ONLY in ${language}.
-- Be short, friendly, human.
-- Light emojis 😊.
-- Use ONLY the information below.
-- If info not found, say it politely.
-- NEVER guess.
-- NEVER mention documents or data.
+- Reply ONLY in ${language}
+- Be friendly, human, WhatsApp-style
+- Light emojis allowed 😊
+- NEVER mention document, data, source
 
-INFO:
-${contextText || "NO_INFO"}
+IF info missing:
+Politely say info is not available and stop.
+
+INFORMATION:
+${contextText || "No relevant information available"}
 `.trim();
 
-    /* 7️⃣ LLM */
+    /* 6️⃣ LLM */
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      temperature: 0.2,
+      temperature: 0.3,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user", content: finalText }
+        { role: "user", content: userText },
       ],
     });
 
-    const reply =
-      completion.choices[0]?.message?.content?.trim() ||
-      fallback(language);
+    const response = completion.choices[0].message.content?.trim();
+    if (!response) {
+      return {
+        success: false,
+        response: null,
+        error: "Empty AI response",
+        noDocuments: false,
+        sent: false,
+      };
+    }
 
-    /* 8️⃣ Send reply */
+    /* 7️⃣ Send WhatsApp */
     await sendWhatsAppMessage(
       fromNumber,
-      reply,
-      process.env.WHATSAPP_11ZA_AUTH_TOKEN!,
-      process.env.WHATSAPP_11ZA_ORIGIN!
+      response,
+      mapping.auth_token,
+      mapping.origin
     );
 
-    /* 9️⃣ Save session */
-    await supabase.from("whatsapp_sessions").upsert({
-      from_number: fromNumber,
-      to_number: toNumber,
-      conversation_state: "ACTIVE",
-      last_user_message: finalText,
+    /* 8️⃣ Save AI message */
+    await supabase.from("whatsapp_messages").insert({
+      message_id: `auto_${messageId}`,
+      from_number: toNumber,
+      to_number: fromNumber,
+      content_text: response,
+      event_type: "MtMessage",
+      auto_respond_sent: true,
+      response_sent_at: new Date().toISOString(),
     });
 
-    return { success: true, response: reply };
+    /* 9️⃣ Mark original */
+    await supabase
+      .from("whatsapp_messages")
+      .update({
+        auto_respond_sent: true,
+        response_sent_at: new Date().toISOString(),
+      })
+      .eq("message_id", messageId);
 
+    return {
+      success: true,
+      response,
+      error: null,
+      noDocuments: false,
+      sent: true,
+    };
   } catch (err) {
-    console.error("AutoResponder Error:", err);
-    return { success: false };
+    console.error("Auto-response error:", err);
+    return {
+      success: false,
+      response: null,
+      error: "Auto response failed",
+      noDocuments: false,
+      sent: false,
+    };
   }
 }
