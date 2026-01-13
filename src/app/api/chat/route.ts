@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server"; // ✅ FIXED
+import { NextResponse } from "next/server";
 import Groq from "groq-sdk";
 import { supabase } from "@/lib/supabaseClient";
 import { embedText } from "@/lib/embeddings";
@@ -8,36 +8,45 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY!,
 });
 
-function getTodayDay() {
+const SMALL_TALK = ["hi", "hello", "hey", "ok", "okay", "thanks", "thank you", "bye"];
+
+function isSmallTalk(message: string) {
+  return SMALL_TALK.includes(message.trim().toLowerCase());
+}
+
+function getToday() {
   return new Date().toLocaleDateString("en-US", { weekday: "long" });
 }
 
 export async function POST(req: Request) {
   try {
-    const body = await req.json();
-    const { session_id, message, file_id } = body;
+    const { session_id, message, file_id } = await req.json();
 
     if (!session_id || !message) {
-      return NextResponse.json(
-        { error: "session_id and message are required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Invalid request" }, { status: 400 });
     }
 
-    /* 1️⃣ Embed user query */
-    const queryEmbedding = await embedText(message);
-    if (!queryEmbedding) {
-      return NextResponse.json({ error: "Embedding failed" }, { status: 500 });
+    const today = getToday();
+
+    /* 1️⃣ Handle small talk WITHOUT embeddings */
+    if (isSmallTalk(message)) {
+      const reply = `Hi 😊 Kaise help kar sakta hoon?`;
+      return new Response(reply, { status: 200 });
     }
 
-    /* 2️⃣ Retrieve candidate chunks (NOT final answer) */
-    const matches = await retrieveRelevantChunks(queryEmbedding, file_id, 8);
+    /* 2️⃣ Try embeddings safely */
+    let contextText = "";
+    try {
+      const embedding = await embedText(message);
+      if (embedding) {
+        const matches = await retrieveRelevantChunks(embedding, file_id, 8);
+        contextText = matches.map(m => m.chunk).join("\n\n");
+      }
+    } catch (err) {
+      console.warn("⚠️ Embedding failed, continuing without RAG");
+    }
 
-    const candidateContext = matches
-      .map((m, i) => `Chunk ${i + 1}:\n${m.chunk}`)
-      .join("\n\n");
-
-    /* 3️⃣ Load chat history */
+    /* 3️⃣ Load history */
     const { data: historyRows } = await supabase
       .from("messages")
       .select("role, content")
@@ -49,111 +58,59 @@ export async function POST(req: Request) {
       content: m.content,
     }));
 
-    const today = getTodayDay();
-
-    /* 4️⃣ SMART SYSTEM PROMPT (MAIN FIX) */
+    /* 4️⃣ SYSTEM PROMPT (DAY AWARE + 4 LANGUAGES) */
     const systemPrompt = `
-You are a smart WhatsApp conversational assistant.
+You are a WhatsApp chatbot.
 
 TODAY IS: ${today}
 
-========================
-LANGUAGE RULES (STRICT)
-========================
-You can reply ONLY in:
+LANGUAGE:
+Reply ONLY in:
 - Hinglish
 - English
-- Hindi (देवनागरी)
-- Gujarati (ગુજરાતી)
+- Hindi
+- Gujarati
 
-Rules:
-- English input → English reply
-- Hindi script → Hindi reply
-- Gujarati script → Gujarati reply
-- Mixed / Roman / casual → Hinglish reply
-- NEVER reply in any other language
-- NEVER mention language detection
+RULES:
+- Match user's language
+- Friendly & natural
+- Short replies
+- Light emojis 😊
 
-========================
-INTELLIGENCE RULE
-========================
-- Understand the user's intent (offer / discount / deal)
-- Identify TODAY using system info
-- From the information below, SELECT ONLY content relevant to TODAY
-- IGNORE all other days completely
-- NEVER dump full content
+INTELLIGENCE:
+- Understand intent (offer / discount / deal)
+- Use ONLY info below
+- Select ONLY TODAY's relevant content
+- Ignore other days
 
-========================
-KNOWLEDGE RULES
-========================
-- Use ONLY the INFORMATION below
-- NEVER guess or assume
-- NEVER add external knowledge
+FALLBACK:
+If info missing:
+"Is topic pe abhi exact info available nahi hai 😊"
 
-FORBIDDEN WORDS:
-document, documents, dataset, knowledge base, training data, source
-
-========================
-FALLBACK RULE
-========================
-If TODAY's info is not available:
-- Politely say info is not available 😊
-- Offer help with something else
-- Do NOT explain why
-
-Fallback examples:
-Hinglish: "Is topic pe abhi exact info available nahi hai 😊 Aap kuch aur pooch sakte ho."
-Hindi: "Is vishay par abhi jaankari uplabdh nahi hai 😊"
-English: "I don’t have the right information on this yet 😊"
-Gujarati: "આ વિષય પર હાલમાં ચોક્કસ માહિતી ઉપલબ્ધ નથી 😊"
-
-========================
-INFORMATION
-========================
-${candidateContext || "NO_INFORMATION_AVAILABLE"}
+INFO:
+${contextText || "NO_INFORMATION_AVAILABLE"}
 `.trim();
 
-    const messages = [
-      { role: "system", content: systemPrompt },
-      ...history,
-      { role: "user", content: message },
-    ];
-
-    /* 5️⃣ Stream response */
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      messages,
+      messages: [
+        { role: "system", content: systemPrompt },
+        ...history,
+        { role: "user", content: message },
+      ],
       temperature: 0.3,
-      stream: true,
     });
 
-    const encoder = new TextEncoder();
-    const stream = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const chunk of completion) {
-            const content = chunk.choices[0]?.delta?.content;
-            if (content) controller.enqueue(encoder.encode(content));
-          }
-          controller.close();
-        } catch (err) {
-          controller.error(err);
-        }
-      },
-    });
+    const answer = completion.choices[0]?.message?.content || 
+      "Abhi ispe exact info available nahi hai 😊";
 
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "text/plain; charset=utf-8",
-        "Transfer-Encoding": "chunked",
-      },
-    });
+    return new Response(answer, { status: 200 });
 
   } catch (err) {
     console.error("CHAT_ERROR:", err);
-    return NextResponse.json(
-      { error: "Chat processing failed" },
-      { status: 500 }
+    return new Response(
+      "Thoda sa issue aa gaya 😅 Please thodi der baad try karein.",
+      { status: 200 }
     );
   }
 }
