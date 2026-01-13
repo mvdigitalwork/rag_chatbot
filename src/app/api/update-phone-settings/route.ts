@@ -13,7 +13,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // 🔍 Check mappings
+    // 🔍 Check existing mappings
     const { data: existingMappings, error: fetchError } = await supabase
       .from("phone_document_mapping")
       .select("*")
@@ -21,20 +21,34 @@ export async function POST(req: NextRequest) {
 
     if (fetchError) throw fetchError;
 
-    if (!existingMappings || existingMappings.length === 0) {
-      return NextResponse.json(
-        { error: "Phone number not found" },
-        { status: 404 }
-      );
-    }
-
-    // 📝 Update mapping
     const updateData: Record<string, any> = {};
     if (intent !== undefined) updateData.intent = intent;
     if (system_prompt !== undefined) updateData.system_prompt = system_prompt;
     if (auth_token !== undefined) updateData.auth_token = auth_token;
     if (origin !== undefined) updateData.origin = origin;
 
+    // 🆕 CASE 1: Phone number NOT found → CREATE
+    if (!existingMappings || existingMappings.length === 0) {
+      const { error: insertError } = await supabase
+        .from("phone_document_mapping")
+        .insert({
+          phone_number,
+          intent: intent ?? null,
+          system_prompt: system_prompt ?? null,
+          auth_token: auth_token ?? null,
+          origin: origin ?? null,
+          file_id: null,
+        });
+
+      if (insertError) throw insertError;
+
+      return NextResponse.json({
+        success: true,
+        message: "Phone settings created successfully",
+      });
+    }
+
+    // ✏️ CASE 2: Phone number exists → UPDATE
     const { error: updateError } = await supabase
       .from("phone_document_mapping")
       .update(updateData)
@@ -42,16 +56,16 @@ export async function POST(req: NextRequest) {
 
     if (updateError) throw updateError;
 
-    // 🔁 Sync credentials to files
-    if (auth_token || origin) {
+    // 🔁 Sync credentials to related files
+    if (auth_token !== undefined || origin !== undefined) {
       const fileIds = existingMappings
         .map(m => m.file_id)
         .filter(Boolean);
 
       if (fileIds.length > 0) {
         const fileUpdate: any = {};
-        if (auth_token) fileUpdate.auth_token = auth_token;
-        if (origin) fileUpdate.origin = origin;
+        if (auth_token !== undefined) fileUpdate.auth_token = auth_token;
+        if (origin !== undefined) fileUpdate.origin = origin;
 
         const { error } = await supabase
           .from("rag_files")
