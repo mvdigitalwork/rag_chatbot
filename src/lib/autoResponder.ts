@@ -25,7 +25,7 @@ function cleanUserName(name?: string | null) {
   return name.replace(/[^\p{L}\p{N}\s]/gu, "").trim();
 }
 
-function greetingPrefix(language: string, name?: string | null) {
+function greetingPrefix(name?: string | null) {
   if (!name) return "";
   return `Hi ${name} 😊 `;
 }
@@ -63,7 +63,7 @@ export async function generateAutoResponse(
       return { success: false, error: "WhatsApp credentials missing" };
     }
 
-    /* 3️⃣ USER TEXT (TEXT / VOICE) */
+    /* 3️⃣ USER TEXT */
     let finalUserText = messageText?.trim() || "";
     if (!finalUserText && mediaUrl) {
       const transcript = await speechToText(mediaUrl);
@@ -91,7 +91,7 @@ export async function generateAutoResponse(
 
     const contextText = matches.map(m => m.chunk).join("\n\n");
 
-    /* 5️⃣ HISTORY */
+    /* 5️⃣ HISTORY (STRICT TYPING FIX) */
     const { data: historyRows } = await supabase
       .from("whatsapp_messages")
       .select("content_text, event_type")
@@ -99,11 +99,14 @@ export async function generateAutoResponse(
       .order("received_at", { ascending: true })
       .limit(15);
 
-    const history = (historyRows || [])
+    const history: {
+      role: "user" | "assistant";
+      content: string;
+    }[] = (historyRows || [])
       .filter(m => m.content_text)
       .map(m => ({
         role: m.event_type === "MoMessage" ? "user" : "assistant",
-        content: m.content_text,
+        content: m.content_text!,
       }));
 
     /* 6️⃣ DAY CONTEXT */
@@ -113,43 +116,39 @@ export async function generateAutoResponse(
 
     const userName = cleanUserName(senderName);
 
-    /* 7️⃣ 🔥 SMART SYSTEM PROMPT */
+    /* 7️⃣ SYSTEM PROMPT */
     const systemPrompt = `
 ${system_prompt || "You are a smart WhatsApp assistant."}
 
-LANGUAGE RULES (STRICT):
-- You can reply ONLY in:
-  Hinglish, English, Hindi (देवनागरी), Gujarati (ગુજરાતી)
-- Match user's writing style naturally
+LANGUAGE RULES:
+- Reply only in Hinglish, English, Hindi (देवनागरी), Gujarati (ગુજરાતી)
+- Match user's writing style
 - Never mention language detection
 
 TODAY:
 - Today is ${currentDay}
 
 INTELLIGENCE:
-- If user asks about offers / discounts / deals:
-  → Respond ONLY with ${currentDay}'s information
-  → Ignore all other days completely
+- For offers / discounts:
+  → Respond ONLY with ${currentDay}'s info
+  → Ignore other days
 
 KNOWLEDGE:
-- Use ONLY the INFORMATION section
-- If today's info is missing:
-  → Politely say it's not available
-  → Do NOT explain why
+- Use ONLY INFORMATION
+- If today's info missing → politely say not available
 
 STYLE:
 - Friendly, short WhatsApp replies
 - Light emojis 😊
-- Never robotic
 
-FORBIDDEN WORDS:
+FORBIDDEN:
 document, dataset, source, training data, knowledge base
 
 INFORMATION:
 ${contextText || "NO_INFORMATION_AVAILABLE"}
 `.trim();
 
-    /* 8️⃣ LLM */
+    /* 8️⃣ LLM (TYPE-SAFE) */
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       temperature: 0.2,
@@ -166,9 +165,9 @@ ${contextText || "NO_INFORMATION_AVAILABLE"}
       return { success: false, error: "Empty AI response" };
     }
 
-    /* 9️⃣ NAME GREETING (ONLY FIRST BOT REPLY) */
+    /* 9️⃣ GREETING (FIRST BOT MESSAGE ONLY) */
     if (history.length === 0 && userName) {
-      reply = greetingPrefix("hinglish", userName) + reply;
+      reply = greetingPrefix(userName) + reply;
     }
 
     /* 🔟 SEND WHATSAPP */
