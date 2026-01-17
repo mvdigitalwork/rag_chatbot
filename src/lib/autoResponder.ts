@@ -10,12 +10,24 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY!,
 });
 
-export type AutoResponseResult = {
-  success: boolean;
-  response?: string;
-  error?: string;
-  noDocuments?: boolean;
-  sent?: boolean;
+type ConversationState = {
+  stage: "INIT" | "ACTIVITY_SELECTED" | "DETAILS" | "CONFIRM";
+  activity: string | null;
+  sub_activity: string | null;
+  group_size: number | null;
+  date: string | null;
+  time: string | null;
+  pending_fields: string[];
+};
+
+const DEFAULT_STATE: ConversationState = {
+  stage: "INIT",
+  activity: null,
+  sub_activity: null,
+  group_size: null,
+  date: null,
+  time: null,
+  pending_fields: [],
 };
 
 /* ---------------- HELPERS ---------------- */
@@ -30,7 +42,58 @@ function greetingPrefix(name?: string | null) {
   return `Hi ${name} 😊 `;
 }
 
-/* ---------------------------------------- */
+function detectReset(text: string) {
+  const resetWords = ["restart", "start again", "menu", "reset"];
+  return resetWords.some(w => text.includes(w));
+}
+
+/* -------- STATE DECISION ENGINE ---------- */
+
+function decideNextState(
+  state: ConversationState,
+  userText: string
+): ConversationState {
+  const text = userText.toLowerCase();
+
+  // ACTIVITY
+  if (!state.activity && text.includes("vr")) {
+    state.activity = "VR Games";
+    state.stage = "ACTIVITY_SELECTED";
+    state.pending_fields = ["group_size", "date", "time"];
+  }
+
+  // SUB ACTIVITY
+  if (state.activity === "VR Games" && text.includes("racing")) {
+    state.sub_activity = "VR Racing";
+  }
+
+  // GROUP SIZE
+  const num = text.match(/\b\d+\b/);
+  if (num && !state.group_size) {
+    state.group_size = Number(num[0]);
+    state.pending_fields = state.pending_fields.filter(f => f !== "group_size");
+  }
+
+  // TIME
+  if ((text.includes("pm") || text.includes("am")) && !state.time) {
+    state.time = userText;
+    state.pending_fields = state.pending_fields.filter(f => f !== "time");
+  }
+
+  // DATE
+  if (text.includes("today") || text.includes("saturday") || text.match(/\d{2}\/\d{2}\/\d{4}/)) {
+    state.date = userText;
+    state.pending_fields = state.pending_fields.filter(f => f !== "date");
+  }
+
+  if (state.pending_fields.length === 0 && state.activity) {
+    state.stage = "CONFIRM";
+  }
+
+  return state;
+}
+
+/* --------------- MAIN ---------------- */
 
 export async function generateAutoResponse(
   fromNumber: string,
@@ -39,7 +102,7 @@ export async function generateAutoResponse(
   messageId: string,
   mediaUrl?: string,
   senderName?: string
-): Promise<AutoResponseResult> {
+) {
   try {
     /* 1️⃣ FILES */
     const fileIds = await getFilesForPhoneNumber(toNumber);
@@ -47,115 +110,104 @@ export async function generateAutoResponse(
       return { success: false, noDocuments: true };
     }
 
-    /* 2️⃣ PHONE CONFIG */
-    const { data: phoneMappings } = await supabase
+    /* 2️⃣ PHONE CONFIG + STATE */
+    const { data: mappings } = await supabase
       .from("phone_document_mapping")
-      .select("system_prompt, auth_token, origin")
+      .select("id, system_prompt, auth_token, origin, conversation_state")
       .eq("phone_number", toNumber)
       .limit(1);
 
-    if (!phoneMappings?.length) {
+    if (!mappings?.length) {
       return { success: false, error: "Phone config missing" };
     }
 
-    const { system_prompt, auth_token, origin } = phoneMappings[0];
-    if (!auth_token || !origin) {
-      return { success: false, error: "WhatsApp credentials missing" };
-    }
+    const mapping = mappings[0];
+    let state: ConversationState =
+      mapping.conversation_state || { ...DEFAULT_STATE };
 
     /* 3️⃣ USER TEXT */
     let finalUserText = messageText?.trim() || "";
     if (!finalUserText && mediaUrl) {
       const transcript = await speechToText(mediaUrl);
-      if (!transcript?.text) {
-        return { success: false, error: "Voice transcription failed" };
-      }
-      finalUserText = transcript.text;
+      finalUserText = transcript?.text || "";
     }
 
     if (!finalUserText) {
       return { success: false, error: "Empty message" };
     }
 
-    /* 4️⃣ EMBEDDING + RAG */
-    const queryEmbedding = await embedText(finalUserText);
-    if (!queryEmbedding) {
-      return { success: false, error: "Embedding failed" };
+    const lowerText = finalUserText.toLowerCase();
+
+    /* 4️⃣ RESET HANDLING */
+    if (detectReset(lowerText)) {
+      state = { ...DEFAULT_STATE };
+    } else {
+      state = decideNextState(state, finalUserText);
     }
 
+    // SAVE STATE
+    await supabase
+      .from("phone_document_mapping")
+      .update({ conversation_state: state })
+      .eq("id", mapping.id);
+
+    /* 5️⃣ RAG */
+    const embedding = await embedText(finalUserText);
     const matches = await retrieveRelevantChunksFromFiles(
-      queryEmbedding,
+      embedding,
       fileIds,
       6
     );
-
     const contextText = matches.map(m => m.chunk).join("\n\n");
 
-    /* 5️⃣ HISTORY (STRICT TYPING FIX) */
+    /* 6️⃣ HISTORY */
     const { data: historyRows } = await supabase
       .from("whatsapp_messages")
       .select("content_text, event_type")
       .or(`from_number.eq.${fromNumber},to_number.eq.${fromNumber}`)
       .order("received_at", { ascending: true })
-      .limit(15);
+      .limit(10);
 
-    const history: {
-      role: "user" | "assistant";
-      content: string;
-    }[] = (historyRows || [])
+    const history = (historyRows || [])
       .filter(m => m.content_text)
       .map(m => ({
         role: m.event_type === "MoMessage" ? "user" : "assistant",
         content: m.content_text!,
       }));
 
-    /* 6️⃣ DAY CONTEXT */
-    const currentDay = new Date().toLocaleDateString("en-US", {
-      weekday: "long",
-    });
-
-    const userName = cleanUserName(senderName);
-
-    /* 7️⃣ SYSTEM PROMPT */
+    /* 7️⃣ SYSTEM PROMPT (STATE AWARE) */
     const systemPrompt = `
-${system_prompt || "You are a smart WhatsApp assistant."}
+You are a human-like booking executive.
 
-LANGUAGE RULES:
-- Reply only in Hinglish, English, Hindi (देवनागरी), Gujarati (ગુજરાતી)
-- Match user's writing style
-- Never mention language detection
+CURRENT STATE:
+- Stage: ${state.stage}
+- Activity: ${state.activity || "not selected"}
+- Sub Activity: ${state.sub_activity || "not selected"}
+- Group size: ${state.group_size || "missing"}
+- Date: ${state.date || "missing"}
+- Time: ${state.time || "missing"}
+- Pending: ${state.pending_fields.join(", ") || "none"}
 
-TODAY:
-- Today is ${currentDay}
-
-INTELLIGENCE:
-- For offers / discounts:
-  → Respond ONLY with ${currentDay}'s info
-  → Ignore other days
+RULES:
+- NEVER restart conversation unless user asks
+- Ask ONLY for pending details
+- NO offers / welcome messages mid-flow
+- If stage is CONFIRM → confirm booking politely
+- Hinglish only
+- Friendly, short WhatsApp replies
 
 KNOWLEDGE:
-- Use ONLY INFORMATION
-- If today's info missing → politely say not available
-
-STYLE:
-- Friendly, short WhatsApp replies
-- Light emojis 😊
-
-FORBIDDEN:
-document, dataset, source, training data, knowledge base
-
-INFORMATION:
-${contextText || "NO_INFORMATION_AVAILABLE"}
+${contextText || "NO_INFORMATION"}
 `.trim();
 
-    /* 8️⃣ LLM (TYPE-SAFE) */
+    /* 8️⃣ LLM */
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       temperature: 0.2,
-      max_tokens: 400,
+      max_tokens: 300,
       messages: [
         { role: "system", content: systemPrompt },
-        ...history.slice(-10),
+        ...history,
         { role: "user", content: finalUserText },
       ],
     });
@@ -165,22 +217,19 @@ ${contextText || "NO_INFORMATION_AVAILABLE"}
       return { success: false, error: "Empty AI response" };
     }
 
-    /* 9️⃣ GREETING (FIRST BOT MESSAGE ONLY) */
-    if (history.length === 0 && userName) {
+    /* 9️⃣ GREETING (ONLY FIRST MESSAGE) */
+    const userName = cleanUserName(senderName);
+    if (state.stage === "INIT" && history.length === 0 && userName) {
       reply = greetingPrefix(userName) + reply;
     }
 
-    /* 🔟 SEND WHATSAPP */
-    const sendResult = await sendWhatsAppMessage(
+    /* 🔟 SEND */
+    await sendWhatsAppMessage(
       fromNumber,
       reply,
-      auth_token,
-      origin
+      mapping.auth_token,
+      mapping.origin
     );
-
-    if (!sendResult.success) {
-      return { success: false, error: sendResult.error };
-    }
 
     /* 11️⃣ SAVE BOT MESSAGE */
     await supabase.from("whatsapp_messages").insert({
@@ -197,11 +246,8 @@ ${contextText || "NO_INFORMATION_AVAILABLE"}
     });
 
     return { success: true, response: reply, sent: true };
-  } catch (error) {
-    console.error("Auto-response error:", error);
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : "Unknown error",
-    };
+  } catch (err) {
+    console.error("Auto-response error:", err);
+    return { success: false, error: "Auto responder failed" };
   }
 }
