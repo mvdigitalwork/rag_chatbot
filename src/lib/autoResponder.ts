@@ -1,3 +1,4 @@
+import type { ChatCompletionMessageParam } from "groq-sdk/resources/chat/completions";
 import { supabase } from "./supabaseClient";
 import { embedText } from "./embeddings";
 import { retrieveRelevantChunksFromFiles } from "./retrieval";
@@ -6,9 +7,13 @@ import { sendWhatsAppMessage } from "./whatsappSender";
 import { speechToText } from "./speechToText";
 import Groq from "groq-sdk";
 
+/* ---------------- GROQ ---------------- */
+
 const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY!,
 });
+
+/* ---------------- STATE ---------------- */
 
 type ConversationState = {
   stage: "INIT" | "ACTIVITY_SELECTED" | "DETAILS" | "CONFIRM";
@@ -50,9 +55,10 @@ function detectReset(text: string) {
 /* -------- STATE DECISION ENGINE ---------- */
 
 function decideNextState(
-  state: ConversationState,
+  prev: ConversationState,
   userText: string
 ): ConversationState {
+  const state: ConversationState = { ...prev };
   const text = userText.toLowerCase();
 
   // ACTIVITY
@@ -81,19 +87,23 @@ function decideNextState(
   }
 
   // DATE
-  if (text.includes("today") || text.includes("saturday") || text.match(/\d{2}\/\d{2}\/\d{4}/)) {
+  if (
+    text.includes("today") ||
+    text.includes("saturday") ||
+    /\d{2}\/\d{2}\/\d{4}/.test(text)
+  ) {
     state.date = userText;
     state.pending_fields = state.pending_fields.filter(f => f !== "date");
   }
 
-  if (state.pending_fields.length === 0 && state.activity) {
+  if (state.activity && state.pending_fields.length === 0) {
     state.stage = "CONFIRM";
   }
 
   return state;
 }
 
-/* --------------- MAIN ---------------- */
+/* ---------------- MAIN ---------------- */
 
 export async function generateAutoResponse(
   fromNumber: string,
@@ -138,14 +148,13 @@ export async function generateAutoResponse(
 
     const lowerText = finalUserText.toLowerCase();
 
-    /* 4️⃣ RESET HANDLING */
+    /* 4️⃣ RESET OR ADVANCE STATE */
     if (detectReset(lowerText)) {
       state = { ...DEFAULT_STATE };
     } else {
       state = decideNextState(state, finalUserText);
     }
 
-    // SAVE STATE
     await supabase
       .from("phone_document_mapping")
       .update({ conversation_state: state })
@@ -160,7 +169,7 @@ export async function generateAutoResponse(
     );
     const contextText = matches.map(m => m.chunk).join("\n\n");
 
-    /* 6️⃣ HISTORY */
+    /* 6️⃣ HISTORY (TYPE SAFE) */
     const { data: historyRows } = await supabase
       .from("whatsapp_messages")
       .select("content_text, event_type")
@@ -168,14 +177,14 @@ export async function generateAutoResponse(
       .order("received_at", { ascending: true })
       .limit(10);
 
-    const history = (historyRows || [])
+    const history: ChatCompletionMessageParam[] = (historyRows || [])
       .filter(m => m.content_text)
       .map(m => ({
         role: m.event_type === "MoMessage" ? "user" : "assistant",
-        content: m.content_text!,
+        content: String(m.content_text),
       }));
 
-    /* 7️⃣ SYSTEM PROMPT (STATE AWARE) */
+    /* 7️⃣ SYSTEM PROMPT */
     const systemPrompt = `
 You are a human-like booking executive.
 
@@ -194,22 +203,24 @@ RULES:
 - NO offers / welcome messages mid-flow
 - If stage is CONFIRM → confirm booking politely
 - Hinglish only
-- Friendly, short WhatsApp replies
+- Short, friendly WhatsApp replies
 
 KNOWLEDGE:
 ${contextText || "NO_INFORMATION"}
 `.trim();
 
-    /* 8️⃣ LLM */
+    /* 8️⃣ LLM (STRICT SAFE) */
+    const messages: ChatCompletionMessageParam[] = [
+      { role: "system", content: systemPrompt },
+      ...history,
+      { role: "user", content: finalUserText },
+    ];
+
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
       temperature: 0.2,
       max_tokens: 300,
-      messages: [
-        { role: "system", content: systemPrompt },
-        ...history,
-        { role: "user", content: finalUserText },
-      ],
+      messages,
     });
 
     let reply = completion.choices[0]?.message?.content;
@@ -217,13 +228,13 @@ ${contextText || "NO_INFORMATION"}
       return { success: false, error: "Empty AI response" };
     }
 
-    /* 9️⃣ GREETING (ONLY FIRST MESSAGE) */
+    /* 9️⃣ GREETING ONLY FIRST MESSAGE */
     const userName = cleanUserName(senderName);
     if (state.stage === "INIT" && history.length === 0 && userName) {
       reply = greetingPrefix(userName) + reply;
     }
 
-    /* 🔟 SEND */
+    /* 🔟 SEND WHATSAPP */
     await sendWhatsAppMessage(
       fromNumber,
       reply,
